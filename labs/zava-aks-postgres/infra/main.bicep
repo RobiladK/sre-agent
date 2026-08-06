@@ -23,6 +23,13 @@ connector is platform-brokered, so dropping the public `AzureMonitor` tag from t
 firewall does not gate it.) Set false to keep the public allow-listed Monitor path instead.''')
 param lockAgentToPrivateMonitor bool = true
 
+@description('''Allow the agent to reach its OWN data-plane endpoint (`*.azuresre.ai`) through the hub
+firewall, default true. Required for the agent to read or write the configuration surfaces ARM does not
+expose — custom instructions, hooks, knowledge files, and global tool enablement. This is also a
+self-modification path (the agent can rewrite its own skills and always-on prompts); set false to keep
+data-plane config strictly operator/CI-applied. See the vnet.bicep param doc.''')
+param allowAgentSelfManagement bool = true
+
 // 4-char hash of the env name appended to the SRE Agent name. Empty when
 // environmentName is blank (e.g. raw `az deployment sub create`), preserving
 // the legacy `sre-agent-${uniqueSuffix}` shape for that path.
@@ -114,6 +121,19 @@ module sreAgent 'modules/sre-agent.bicep' = {
     managedResourceGroupId: rg.id
     aksClusterName: aks.outputs.clusterName
     agentSubnetId: vnet.outputs.agentSubnetId
+  }
+}
+
+// Agent data-plane firewall rule — pinned to the agent's exact hostname (not the
+// broad *.azuresre.ai wildcard). Deployed AFTER the agent resource because the
+// hostname is platform-assigned at agent creation time and cannot be computed in
+// Bicep before it exists. See firewall-agent-dataplane.bicep header.
+module firewallAgentDataPlane 'modules/firewall-agent-dataplane.bicep' = if (allowAgentSelfManagement) {
+  scope: rg
+  name: 'firewall-agent-dataplane'
+  params: {
+    firewallPolicyName: vnet.outputs.firewallPolicyName
+    agentEndpoint: sreAgent.outputs.agentEndpoint
   }
 }
 

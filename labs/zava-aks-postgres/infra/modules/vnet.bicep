@@ -552,6 +552,10 @@ resource ruleCollectionGroup 'Microsoft.Network/firewallPolicies/ruleCollectionG
               'graph.microsoft.com'
             ]
           }
+          // The agent's OWN data-plane rule (allow-agent-data-plane) is NOT here —
+          // it lives in firewall-agent-dataplane.bicep, deployed AFTER the agent
+          // resource so it can pin to the agent's exact hostname (platform-assigned
+          // at creation time, not computable in Bicep beforehand). See main.bicep.
         ]
       }
       {
@@ -653,5 +657,6 @@ output platformVnetId string = platformVnet.id
 output agentVnetId string = agentVnet.id
 output peSubnetId string = '${hubVnet.id}/subnets/pe-subnet'
 output firewallName string = firewall.name
+output firewallPolicyName string = firewallPolicy.name
 output firewallId string = firewall.id
 output firewallPrivateIp string = firewallPrivateIp

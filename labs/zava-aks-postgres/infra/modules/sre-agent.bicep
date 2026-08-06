@@ -463,6 +463,93 @@ If any of those is missed, hand off to the matching domain skill: `database-inci
   sourcePluginInstallation: null
 }
 
+// Cross-alert correlation ("is this the tree or the forest?").
+//
+// This skill exists because the platform CANNOT hand the agent a forest view.
+// Every response plan here runs `mergeEnabled: false`, and Azure Monitor merging
+// is same-alert-rule-only, so each fired alert opens its OWN isolated thread with
+// no visibility into what else fired. Structural isolation is the default. The
+// only way an investigation sees the wider picture is if it PULLS it.
+//
+// Deliberately NOT put in the alert `description` fields (AGENTS.md forbids
+// semantics there, and a per-alert string can't express a cross-alert idea), and
+// NOT duplicated into all four incidentFilters (four copies = drift). The cheap
+// always-on trigger lives in `sre-config/custom-instructions.md`, applied to the
+// agent-global customInstructions surface by scripts/setup-sre-agent.ps1 (Step 2d);
+// this skill carries the expensive procedure and loads only when that trigger fires.
+// That split is the token-cost design: ~200 always-on tokens, full method on demand.
+var correlationSkill = {
+  description: 'Use at the START of any Zava incident investigation to check whether the dispatched alert is the whole story — enumerate every OTHER Azure Monitor alert that fired in the same window, the alert-rule inventory (including DISABLED rules that would have named the cause), and Azure Service Health for platform events. Separates a genuine causal chain from unrelated faults that merely overlapped. Also use when an incident does not add up, when a remediation did not hold, or when a symptom appears to precede its own cause.'
+  tools: [
+    'RunAzCliReadCommands'
+    'RunInTerminal'
+    'SearchMemory'
+  ]
+  skillContent: '''## Cross-alert correlation runbook (Zava)
+
+@@SHARED@@
+
+You were dispatched on ONE alert. That alert is a filter someone wrote in advance, on one signal, with one threshold — it is evidence, not a conclusion, and it cannot tell you whether it is the cause, a symptom, or a coincidence. Every response plan in this deployment has merge DISABLED, so a single root cause opens several INDEPENDENT threads that cannot see each other. Nobody assembles the forest for you. Pull it.
+
+Do this EARLY (it reframes the investigation and is cheap), and run the reads in PARALLEL with your first domain queries — not after.
+
+## 1. What else fired? (the forest)
+
+`az graph query` is usually unavailable (resource-graph extension absent). Use the Alerts Management REST API:
+
+`az rest --method get --url "https://management.azure.com/subscriptions/<sub>/providers/Microsoft.AlertsManagement/alerts?api-version=2019-05-05-preview&timeRange=1d&pageCount=250" --query "value[].{rule:properties.essentials.alertRule, sev:properties.essentials.severity, cond:properties.essentials.monitorCondition, start:properties.essentials.startDateTime, target:properties.essentials.targetResource}" -o json`
+
+- `pageCount` MUST be 1..250 (larger returns BadRequest). `timeRange` accepts 1h/1d/7d/30d only.
+- `RunAzCliReadCommands` rejects shell pipes and `&&` — one command per call, or use RunInTerminal.
+- For LOG alerts `targetResource` is the Log Analytics WORKSPACE, not the app or DB. Do not group by it; parse the resource group out of the rule ID to identify the environment.
+
+## 2. Which alerts SHOULD have fired but did not? (the silent cause)
+
+A missing alert is a finding. Enumerate the rule INVENTORY, not just fired alerts:
+
+`az monitor metrics alert list -g @@RG@@ --query "[].{name:name, enabled:enabled, scopes:scopes}" -o json`
+`az rest --method get --url "https://management.azure.com/subscriptions/<sub>/resourceGroups/@@RG@@/providers/microsoft.insights/scheduledQueryRules?api-version=2023-03-15-preview" --query "value[].{name:name, enabled:properties.enabled, window:properties.windowSize, freq:properties.evaluationFrequency}" -o json`
+
+If a rule sits on the resource you are investigating and is `enabled: false`, the causal signal is MUTED — query that metric directly rather than concluding the resource was healthy. This deployment ships `Zava-db-cpu-saturation` disabled on purpose; PG CPU can be pegged at 90% with no DB alert anywhere.
+
+## 3. Is the platform itself the cause?
+
+Azure Service Health, subscription-scoped — covers regional outages and planned maintenance:
+
+`az rest --method get --url "https://management.azure.com/subscriptions/<sub>/providers/Microsoft.ResourceHealth/events?api-version=2022-10-01&queryStartTime=<ISO8601>" --query "value[].{type:properties.eventType, level:properties.eventLevel, status:properties.status, title:properties.title, start:properties.impactStartTime}" -o json`
+
+`eventType` is `ServiceIssue` (outage), `PlannedMaintenance`, or `HealthAdvisory`. Per-resource view:
+`az rest --method get --url "https://management.azure.com/subscriptions/<sub>/resourceGroups/@@RG@@/providers/Microsoft.ResourceHealth/availabilityStatuses?api-version=2023-07-01-preview" --query "value[].{res:id, avail:properties.availabilityState, summary:properties.summary}" -o json`
+
+Check this BEFORE concluding "platform health event" from absence of evidence. A `PlannedMaintenance` event naming PostgreSQL turns a guess into a fact, and it changes the remediation: you wait and document instead of chasing config.
+
+## 4. TWO RULES — violate these and correlation makes you WORSE, not better
+
+**Alert fire order is NOT causal order.** Every dispatching rule here is `PT5M` window / `PT5M` evaluation, so detection latency is up to 5 min plus ingestion lag. A symptom alert can fire BEFORE the cause alert. Any gap under ~7 minutes proves nothing about ordering. Establish onset from raw telemetry in 1-2 minute buckets, never from alert timestamps.
+
+**Co-firing is NOT causation.** Two alerts seconds apart can be two unrelated faults. Before claiming a causal chain, confirm the mechanism in telemetry:
+
+| Observation | Reading |
+|---|---|
+| HTTP 500, failed dependencies ONLY on `localhost:3001`, zero PG dependency failures | app-layer regression |
+| HTTP 503, failed dependencies against the PG target | DB unreachable |
+| No dependency FAILURES but PG `cpu_percent` high and latency up | DB saturation — slow but SUCCESSFUL queries, so failure-based signals stay clean |
+
+The single fastest discriminator is one `dependencies` query split by `target` alongside `resultCode`. If two co-firing alerts have different mechanisms, they are independent — report them as separate incidents and do not merge the narrative.
+
+**Environment containment:** alerts from a DIFFERENT resource group are a different Zava stack. Same-RG co-firing suggests a shared cause; cross-RG simultaneity suggests a platform event (check step 3). Never merge findings across resource groups without that check.
+
+## 5. Report
+
+State plainly which it was: (a) one cause, several alerts; (b) several independent causes that overlapped; or (c) this alert is the whole story. If (c), say so in one line and move on — a correlation sweep that finds nothing is a successful sweep, not wasted work.
+
+## Boundaries
+Read-only. This skill never remediates — hand off to `database-incidents`, `performance-incidents`, or `application-incidents` with the correlation context attached.
+'''
+  additionalFiles: []
+  sourcePluginInstallation: null
+}
+
 // NOTE: Browser-based site diagnosis is intentionally NOT defined as an SRE
 // Agent skill. The `BrowseWebPage` / Browser Operator tool is not generally
 // available to deployed SRE Agents, so a skill that references it would never
@@ -522,6 +609,20 @@ resource skillProactiveHealth 'Microsoft.App/agents/skills@2025-05-01-preview' =
   properties: {
     value: base64(string(union(proactiveHealthSkill, {
       skillContent: replace(proactiveHealthSkill.skillContent, '@@RG@@', rgName)
+    })))
+  }
+}
+
+// Sixth skill. The "max 5 concurrent" limit is on skills ACTIVE in a thread, not
+// on skills defined — a domain skill plus this correlation skill is 2 of 5, which
+// is the intended pairing.
+#disable-next-line BCP081
+resource skillCorrelation 'Microsoft.App/agents/skills@2025-05-01-preview' = {
+  parent: sreAgent
+  name: 'incident-correlation'
+  properties: {
+    value: base64(string(union(correlationSkill, {
+      skillContent: replace(replace(correlationSkill.skillContent, '@@SHARED@@', sharedContext), '@@RG@@', rgName)
     })))
   }
 }

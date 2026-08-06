@@ -283,6 +283,77 @@ if ($kubePresent.Count -gt 0 -and $kubePresent.Count -eq $kubectlTools.Count -an
     $kContent.Dispose()
 }
 
+# --- Step 2d: Sync custom instructions (data-plane only) --------------------
+# Custom instructions are the agent-scoped, ALWAYS-ON prompt appended to EVERY
+# thread — chat, incident, scheduled task — regardless of which response plan or
+# skill matched. This is the surface the portal's "Custom instructions" box writes.
+#
+# API (undocumented at time of writing; captured from the portal's own network
+# trace, verified 200 OK):
+#   GET/PUT {agentEndpoint}/api/v2/agent/customInstructions
+#   body: { "instructions": "<text>" }
+#
+# THREE things to note, all of which differ from the other data-plane objects:
+#   1. It is a SINGLETON, not a named collection — no /{name} path segment. There
+#      is exactly one instructions blob per agent, so everything you want globally
+#      must be concatenated into this one document. That is a strong argument for
+#      keeping it short (see AGENTS.md for the minimalism rationale).
+#   2. The body is FLAT — { instructions } — not the
+#      { name, type, tags, properties } envelope that /api/v2/extendedAgent/*
+#      objects (hooks, commonprompts, plugins) use.
+#   3. It lives under /api/v2/agent/ — the same family as the tools/configure
+#      calls in Steps 2b/2c — NOT under /api/v2/extendedAgent/.
+#
+# Do not confuse this with `commonPrompts`
+# (PUT /api/v2/extendedAgent/commonprompts/{name}), which is a NAMED collection
+# that subagents opt into via their own `commonPrompts: [...]` field. That is a
+# different feature; it is not what the portal's global box writes, and it is not
+# what gets appended to every thread.
+#
+# We ship the correlation nudge: the cheap always-on trigger telling the agent an
+# alert is a signal rather than the whole story, pointing at the
+# `incident-correlation` SKILL (Bicep) for the actual queries.
+Write-Host "`nStep 2d: Syncing custom instructions..." -ForegroundColor Yellow
+$ciPath = Join-Path $PSScriptRoot "..\sre-config\custom-instructions.md"
+if (-not (Test-Path $ciPath)) {
+    Write-Host "  (no sre-config/custom-instructions.md; skipping)" -ForegroundColor DarkGray
+} else {
+    # The file content IS the payload verbatim — there is no metadata wrapper and
+    # no comment syntax to strip, so keep rationale in AGENTS.md, never in here.
+    $ciText = ([System.IO.File]::ReadAllText($ciPath)).Replace('@@RG@@', $ResourceGroup).Trim()
+
+    # Compare against what's live so a re-run is a no-op. The service normalises
+    # line endings to CRLF on write, so strip \r on BOTH sides before comparing —
+    # otherwise a file saved with LF looks "changed" on every single run.
+    $ciCurrent = $null
+    try {
+        $getResp = $client.GetAsync("$agentEndpoint/api/v2/agent/customInstructions").Result
+        if ($getResp.IsSuccessStatusCode) {
+            $ciCurrent = ($getResp.Content.ReadAsStringAsync().Result | ConvertFrom-Json).instructions
+        }
+    } catch {}
+    $normalize = { param($s) if ($null -eq $s) { '' } else { $s.Replace("`r", '').Trim() } }
+
+    if ((& $normalize $ciCurrent) -eq (& $normalize $ciText)) {
+        Write-Host "  [skip] custom instructions unchanged ($($ciText.Length) chars)" -ForegroundColor DarkGray
+    } else {
+        $ciBody = @{ instructions = $ciText } | ConvertTo-Json -Depth 4 -Compress
+        $ciContent = [System.Net.Http.StringContent]::new($ciBody, [System.Text.Encoding]::UTF8, "application/json")
+        $ciResp = $client.PutAsync("$agentEndpoint/api/v2/agent/customInstructions", $ciContent).Result
+        if ($ciResp.IsSuccessStatusCode) {
+            $verb = if ([string]::IsNullOrWhiteSpace($ciCurrent)) { "set" } else { "replaced" }
+            Write-Host "  [ok] custom instructions $verb ($($ciText.Length) chars, appended to every thread)" -ForegroundColor Green
+        } else {
+            # Non-fatal: the lab still works without it — the agent just loses the
+            # always-on correlation nudge (the skill remains reachable on demand).
+            # A 403/timeout here usually means the hub firewall is missing the
+            # allow-agent-data-plane rule (*.azuresre.ai) — see vnet.bicep.
+            Write-Host "  WARNING: custom instructions returned $($ciResp.StatusCode): $($ciResp.Content.ReadAsStringAsync().Result)" -ForegroundColor Yellow
+        }
+        $ciContent.Dispose()
+    }
+}
+
 # --- Step 3: Verify Bicep-deployed assets ----------------------------------
 Write-Host "`nStep 3: Verifying Bicep-deployed configuration..." -ForegroundColor Yellow
 $allGood = $true
@@ -299,7 +370,7 @@ if (-not $missingConnectors) { Write-Host "  [OK] Connectors: $($connectors.Coun
 else { Write-Host "  [MISSING] Connectors: $($missingConnectors -join ', ') — re-run azd provision" -ForegroundColor Red; $allGood = $false }
 
 $skills = @(Get-AgentChildren -Kind "skills")
-$expectedSkills = @("database-incidents","performance-incidents","application-incidents","general-triage","proactive-health-check")
+$expectedSkills = @("database-incidents","performance-incidents","application-incidents","general-triage","proactive-health-check","incident-correlation")
 $missingSkills = $expectedSkills | Where-Object { $_ -notin $skills.name }
 if (-not $missingSkills) { Write-Host "  [OK] Custom skills: $($skills.Count)" -ForegroundColor Green }
 else { Write-Host "  [MISSING] Skills: $($missingSkills -join ', ') — re-run azd provision" -ForegroundColor Red; $allGood = $false }

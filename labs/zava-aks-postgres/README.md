@@ -98,6 +98,36 @@ While the UI shows `agent investigating`, the SRE Agent is actually working the 
 Liveness and readiness (`/livez`) stay green, and `/api/health` can stay healthy for app-only regressions, so the platform looks healthy while
 only the app route regresses — deployment-signal correlation is what ties the symptom to its cause.
 
+### Scenario 5: Compound — two independent faults, one window
+```powershell
+.\.github\skills\running-demo\scripts\break-compound.ps1  # Scenario 3 + Scenario 4, offset by 90s
+# TWO alerts co-fire (Zava-products-query-slow + Zava-http-5xx-errors) into SEPARATE threads
+# (merge is disabled on every response plan). They are NOT causally related.
+.\.github\skills\running-demo\scripts\fix-compound.ps1    # Fallback: undoes both
+```
+Scenarios 1–4 inject exactly one fault each, so "diagnose the alert you were handed" always works — a habit that
+breaks in production. This scenario is the counterexample. The tempting read is *"the database got slow, so the API
+started failing"*: it fits the timestamps perfectly and it is **false**. The mechanisms are disjoint —
+
+| Signal | 5xx fault | Slow-query fault |
+|---|---|---|
+| Status code | HTTP **500** | n/a (requests succeed) |
+| Failed dependencies | `localhost:3001` **only** | **none** — queries are slow but *succeed* |
+| PG dependency failures | **zero** | **zero** |
+| PG `cpu_percent` | baseline | pegged ~90% |
+
+If DB saturation were causing the 5xx you would see PG dependency failures or 503 timeouts. Neither appears.
+Two faults, one window, no causal link.
+
+Two further traps are built in. **Alert fire order is not causal order** — every dispatching rule is `PT5M`/`PT5M`,
+so detection latency swamps the 90-second injection offset. And the *causal* DB signal never alerts at all:
+`Zava-db-cpu-saturation` ships **disabled** (see [`AGENTS.md`](AGENTS.md)), mimicking an org that muted a noisy
+rule months ago, so the agent has to enumerate the alert **rule inventory** — not just fired alerts — to discover it.
+
+Handling this well is what the `incident-correlation` skill and the always-on
+[`sre-config/custom-instructions.md`](sre-config/custom-instructions.md) nudge
+exist for: an alert is a signal, not the story.
+
 ## SRE Agent Management
 
 Agent configuration is fully declarative in **`infra/modules/sre-agent.bicep`** —
